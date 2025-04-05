@@ -1,0 +1,445 @@
+---
+title: "Leah Modeling Final"
+author: "Leah Ekblad"
+date: "2025-03-13"
+output: html_document
+---
+ 
+# Data Preparation
+```{r include=FALSE, echo = FALSE, warnings = FALSE, message = FALSE}
+library(vroom) # for quickly reading in/writing out
+library(tidyverse)
+library(tidymodels)
+library(lubridate) # to seperate date 
+library(DataExplorer)
+library(caret)
+library(car) # helps check for multicollinarity 
+library(MASS) # for boxcox 
+library(glmnet)
+```
+
+```{r include=FALSE, echo = FALSE, warnings = FALSE, message = FALSE}
+train <- vroom("train_set.csv")
+test <- vroom("test_set.csv")
+```
+
+### Train and Test Set
+```{r}
+train_set <- train |> 
+   mutate(across(c(CUSTOMER_NUMBER, ORDER_TYPE, PRIMARY_GROUP_NUMBER,
+                  FREQUENT_ORDER_TYPE, COLD_DRINK_CHANNEL, 
+                  TRADE_CHANNEL, SUB_TRADE_CHANNEL, LOCAL_MARKET_PARTNER, 
+                  CO2_CUSTOMER, ZIP_CODE, ORDER_GROUPING), as.factor)) |> 
+  mutate(across(c(TRANSACTION_DATE, FIRST_DELIVERY_DATE, ON_BOARDING_DATE), 
+                ~ as.Date(., format = "%m/%d/%Y"))) |> 
+  mutate(MONTH = month(TRANSACTION_DATE), LOADED_DIFFERENCE = 
+           TOTAL_UNITS_ORDERED - TOTAL_UNITS_LOADED, SHIPMENT_DIFFERENCE = 
+           TOTAL_UNITS_LOADED - TOTAL_UNITS_DELIVERED) |> 
+    mutate(across(c(WEEK, MONTH), as.factor)) |> 
+  mutate(TOTAL_UNITS_ORDERED= ifelse(
+    TOTAL_UNITS_ORDERED == min(TOTAL_UNITS_ORDERED), 
+    TOTAL_UNITS_ORDERED + abs(min(TOTAL_UNITS_ORDERED)) + 0.01,
+    TOTAL_UNITS_ORDERED)) |> 
+  dplyr::select(-c(ORDERED_CASES,LOADED_CASES,DELIVERED_CASES,ORDERED_GALLONS,
+                   LOADED_GALLONS, DELIVERED_GALLONS, TRANSACTION_DATE, 
+                   full.address, ZIP_CODE, PRIMARY_GROUP_NUMBER))
+
+# Now do the same to test 
+test_set <- test |> 
+   mutate(across(c(CUSTOMER_NUMBER, ORDER_TYPE, PRIMARY_GROUP_NUMBER,
+                  FREQUENT_ORDER_TYPE, COLD_DRINK_CHANNEL, 
+                  TRADE_CHANNEL, SUB_TRADE_CHANNEL, LOCAL_MARKET_PARTNER, 
+                  CO2_CUSTOMER, ZIP_CODE, ORDER_GROUPING), as.factor)) |> 
+  mutate(across(c(TRANSACTION_DATE, FIRST_DELIVERY_DATE, ON_BOARDING_DATE), 
+                ~ as.Date(., format = "%m/%d/%Y"))) |> 
+  mutate(MONTH = month(TRANSACTION_DATE), LOADED_DIFFERENCE = 
+           TOTAL_UNITS_ORDERED - TOTAL_UNITS_LOADED, SHIPMENT_DIFFERENCE = 
+           TOTAL_UNITS_LOADED - TOTAL_UNITS_DELIVERED) |> 
+    mutate(across(c(WEEK, MONTH), as.factor)) |> 
+  mutate(TOTAL_UNITS_ORDERED= ifelse(
+    TOTAL_UNITS_ORDERED == min(TOTAL_UNITS_ORDERED), 
+    TOTAL_UNITS_ORDERED + abs(min(TOTAL_UNITS_ORDERED)) + 0.01,
+    TOTAL_UNITS_ORDERED)) |> 
+  dplyr::select(-c(ORDERED_CASES,LOADED_CASES,DELIVERED_CASES,ORDERED_GALLONS,
+                   LOADED_GALLONS, DELIVERED_GALLONS, TRANSACTION_DATE, 
+                   full.address, ZIP_CODE, PRIMARY_GROUP_NUMBER))
+```
+
+### Seperate DataFrames by year
+```{r}
+# Separate the data into 2023 and 2024 subsets
+
+# By year 2023
+train_2023 <- train_set %>% filter(YEAR == 2023)
+test_2023 <- test_set %>% filter(YEAR == 2023)
+
+# filtered by year 2024
+train_2024 <- train_set %>% filter(YEAR == 2024)
+test_2024 <- test_set %>% filter(YEAR == 2024)
+```
+
+### Method when not Using Server
+```{r}
+set.seed(123)
+
+# Get samples of the data, 367,361
+train_2023_data <- train_2023[sample(nrow(train_2023), 6000), ] |> 
+  dplyr::select(-YEAR)
+
+# test data 2023
+test_2023 <- test_2023[sample(nrow(test_2023), 6000), ] |> 
+  dplyr::select(-YEAR)
+
+# Get samples of the data
+train_2024_data <- train_2024[sample(nrow(train_2024), 6000), ] |> 
+  dplyr::select(-YEAR)
+
+# test data 2023
+test_2024 <- test_2024[sample(nrow(test_2024), 6000), ] |> 
+  dplyr::select(-YEAR)
+
+# There is no near zero variance either 
+# nearZeroVar(train_2023_data, saveMetrics = TRUE)
+# nearZeroVar(train_2024_data, saveMetrics = TRUE)
+```
+
+### step_log and step_boxcox 
+```{r}
+# Create a recipe with step_novel for unseen factor levels
+my_recipe <- recipe(TOTAL_UNITS_ORDERED ~ ., data = train_2023_data) %>%
+  step_novel(all_nominal(), new_level = "Unknown") %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% # should prevent dummy variable trap 
+  step_nzv(all_predictors()) |> 
+  step_select(-TOTAL_UNITS_LOADED, -TOTAL_UNITS_DELIVERED,
+              -SUB_TRADE_CHANNEL_FSR...MISC, -SUB_TRADE_CHANNEL_OTHER.DINING, 
+              -TRADE_CHANNEL_GENERAL, -TRADE_CHANNEL_OUTDOOR.ACTIVITIES, 
+              -SUB_TRADE_CHANNEL_COMPREHENSIVE.PROVIDER) %>%   
+  step_normalize(all_numeric_predictors()) 
+
+# Prepare the recipe with the training data
+prepped <- prep(my_recipe, training = train_2023_data)
+
+# Apply the recipe to the training and test data
+train_transformed23 <- bake(prepped, new_data = train_2023_data)
+test_transformed23 <- bake(prepped, new_data = test_2023)
+```
+
+### Create a recipe 
+```{r}
+# Create a recipe with step_novel for unseen factor levels
+my_recipe <- recipe(TOTAL_UNITS_ORDERED ~ ., data = train_2024_data) %>%
+  step_novel(all_nominal(), new_level = "Unknown") %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% # should prevent dummy variable trap 
+  step_nzv(all_predictors()) |> 
+  step_select(-TOTAL_UNITS_LOADED, -TOTAL_UNITS_DELIVERED,
+              -TRADE_CHANNEL_GENERAL, -SUB_TRADE_CHANNEL_FSR...MISC, 
+              -SUB_TRADE_CHANNEL_OTHER.DINING, 
+              -SUB_TRADE_CHANNEL_OTHER.OUTDOOR.ACTIVITIES, 
+              -TRADE_CHANNEL_OUTDOOR.ACTIVITIES) %>%   
+  step_normalize(all_numeric_predictors()) 
+
+# Prepare the recipe with the training data
+prepped <- prep(my_recipe, training = train_2024_data)
+
+# Apply the recipe to the training and test data
+train_transformed24 <- bake(prepped, new_data = train_2024_data)
+test_transformed24 <- bake(prepped, new_data = test_2024)
+```
+
+# Leah's Models
+_______________________________________________________________________________
+
+### Linear model for 2023
+```{r}
+# Build Linear Regression Model using multiple predictors
+lm_model <- lm(TOTAL_UNITS_ORDERED ~ ., data = train_transformed23)
+
+# Make Predictions
+predictions <- predict(lm_model, newdata = test_transformed23)
+
+# Manually Calculate RMSE, MAE, R-squared, and Adjusted R-squared
+rmse_value <- sqrt(mean((test_transformed23$TOTAL_UNITS_ORDERED - predictions)^2))
+mae_value <- mean(abs(test_transformed23$TOTAL_UNITS_ORDERED - predictions))
+r_squared <- cor(test_transformed23$TOTAL_UNITS_ORDERED, predictions)^2
+
+# Adjusted R-squared calculation
+n <- nrow(test_transformed23)  # Number of observations
+p <- length(lm_model$coefficients) - 1  # Number of predictors
+adj_r_squared <- 1 - ((1 - r_squared) * (n - 1) / (n - p - 1))
+
+# Output Results
+cat("Linear Regression Model Performance:\n")
+cat("RMSE:", rmse_value, "\n")
+cat("R-squared:", r_squared, "\n")
+cat("MAE:", mae_value, "\n")
+cat("Adjusted R-Squared:", adj_r_squared, "\n")
+
+# View Predictions
+output_data <- test_transformed23 %>%
+  mutate(Predicted_UNITS_ORDERED = predictions)
+
+# Display results in console
+head(output_data)
+```
+
+### Lasso/Ridge 2023
+```{r}
+# Convert categorical variables to dummy variables
+x_train <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = train_transformed23)[,-1]
+x_test <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = test_transformed23)[,-1]
+y_train <- train_transformed23$TOTAL_UNITS_ORDERED
+
+# Ensure all features are numeric
+x_train <- as.matrix(x_train)
+x_test <- as.matrix(x_test)
+y_train <- as.numeric(y_train)
+
+# Ridge Regression (alpha = 0)
+ridge_model <- cv.glmnet(x_train, y_train, alpha = 0)  # Cross-validated Ridge
+ridge_preds <- predict(ridge_model, newx = x_test, s = "lambda.min")
+
+# Evaluate Ridge Model
+ridge_rmse <- sqrt(mean((test_transformed23$TOTAL_UNITS_ORDERED - ridge_preds)^2))
+ridge_mae <- mean(abs(test_transformed23$TOTAL_UNITS_ORDERED - ridge_preds))
+ridge_r2 <- cor(test_transformed23$TOTAL_UNITS_ORDERED, ridge_preds)^2
+
+# Adjusted R-squared Calculation
+n <- nrow(test_transformed23)
+p <- length(coef(ridge_model, s = "lambda.min")) - 1
+ridge_adj_r2 <- 1 - ((1 - ridge_r2) * (n - 1) / (n - p - 1))
+
+# Output Ridge Results
+cat("Ridge Regression Model Performance:\n")
+cat("RMSE:", ridge_rmse, "\n")
+cat("R-squared:", ridge_r2, "\n")
+cat("MAE:", ridge_mae, "\n")
+cat("Adjusted R-Squared:", ridge_adj_r2, "\n")
+```
+
+### Linear model for 2024
+```{r}
+# Build Linear Regression Model using multiple predictors
+lm_model_24 <- lm(TOTAL_UNITS_ORDERED ~ ., data = train_transformed24)
+
+# Make Predictions
+predictions_24 <- predict(lm_model_24, newdata = test_transformed24)
+
+# Manually Calculate RMSE, MAE, R-squared, and Adjusted R-squared
+rmse_value_24 <- sqrt(mean((test_transformed24$TOTAL_UNITS_ORDERED - predictions_24)^2))
+mae_value_24 <- mean(abs(test_transformed24$TOTAL_UNITS_ORDERED - predictions_24))
+r_squared_24 <- cor(test_transformed24$TOTAL_UNITS_ORDERED, predictions_24)^2
+
+# Adjusted R-squared calculation
+n_24 <- nrow(test_transformed24)  # Number of observations
+p_24 <- length(lm_model_24$coefficients) - 1  # Number of predictors
+adj_r_squared_24 <- 1 - ((1 - r_squared_24) * (n_24 - 1) / (n_24 - p_24 - 1))
+
+# Output Results
+cat("Linear Regression Model Performance:\n")
+cat("RMSE:", rmse_value_24, "\n")
+cat("R-squared:", r_squared_24, "\n")
+cat("MAE:", mae_value_24, "\n")
+cat("Adjusted R-Squared:", adj_r_squared_24, "\n")
+
+# View Predictions
+output_data_24 <- test_transformed24 %>%
+  mutate(Predicted_UNITS_ORDERED = predictions_24)
+
+# Display results in console
+head(output_data_24)
+```
+
+### Lasso/Ridge 2024
+```{r}
+# Convert categorical variables to dummy variables
+x_train_24 <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = train_transformed24)[,-1]
+x_test_24 <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = test_transformed24)[,-1]
+y_train_24 <- train_transformed24$TOTAL_UNITS_ORDERED
+
+# Ensure all features are numeric
+x_train_24 <- as.matrix(x_train_24)
+x_test_24 <- as.matrix(x_test_24)
+y_train_24 <- as.numeric(y_train_24)
+
+# Ridge Regression (alpha = 0)
+ridge_model_24 <- cv.glmnet(x_train_24, y_train_24, alpha = 0)  # Cross-validated Ridge
+ridge_preds_24 <- predict(ridge_model_24, newx = x_test_24, s = "lambda.min")
+
+# Evaluate Ridge Model
+ridge_rmse_24 <- sqrt(mean((test_transformed24$TOTAL_UNITS_ORDERED - ridge_preds_24)^2))
+ridge_mae_24 <- mean(abs(test_transformed24$TOTAL_UNITS_ORDERED - ridge_preds_24))
+ridge_r2_24 <- cor(test_transformed24$TOTAL_UNITS_ORDERED, ridge_preds_24)^2
+
+# Adjusted R-squared Calculation
+n_24 <- nrow(test_transformed24)
+p_24 <- length(coef(ridge_model_24, s = "lambda.min")) - 1
+ridge_adj_r2_24 <- 1 - ((1 - ridge_r2_24) * (n_24 - 1) / (n_24 - p_24 - 1))
+
+# Output Ridge Results
+cat("Ridge Regression Model Performance:\n")
+cat("RMSE:", ridge_rmse_24, "\n")
+cat("R-squared:", ridge_r2_24, "\n")
+cat("MAE:", ridge_mae_24, "\n")
+cat("Adjusted R-Squared:", ridge_adj_r2_24, "\n")
+```
+
+## Solve for multicolinearity 
+```{r}
+# Create a recipe with step_novel for unseen factor levels
+my_recipe <- recipe(TOTAL_UNITS_ORDERED ~ ., data = train_2023_data) %>%
+  step_novel(all_nominal(), new_level = "Unknown") %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% # should prevent dummy variable trap 
+  step_nzv(all_predictors()) |> 
+  step_select(-TOTAL_UNITS_LOADED, -TOTAL_UNITS_DELIVERED,
+              -SUB_TRADE_CHANNEL_FSR...MISC, -SUB_TRADE_CHANNEL_OTHER.DINING, 
+              -TRADE_CHANNEL_GENERAL, -TRADE_CHANNEL_OUTDOOR.ACTIVITIES, 
+              -SUB_TRADE_CHANNEL_COMPREHENSIVE.PROVIDER) %>%   
+  step_normalize(all_numeric_predictors()) 
+
+# Prepare the recipe with the training data
+prepped <- prep(my_recipe, training = train_2023_data)
+
+# Apply the recipe to the training and test data
+train_transformed23 <- bake(prepped, new_data = train_2023_data)
+test_transformed23 <- bake(prepped, new_data = test_2023)
+
+# Build Linear Regression Model using multiple predictors
+lm_model <- lm(TOTAL_UNITS_ORDERED ~ ., data = train_transformed23)
+
+# Make Predictions
+predictions <- predict(lm_model, newdata = test_transformed23)
+
+# Manually Calculate RMSE, MAPE, R-squared, and Adjusted R-squared
+rmse_value <- sqrt(mean((test_transformed23$TOTAL_UNITS_ORDERED - predictions)^2))
+mape_value <- mean(abs((test_transformed23$TOTAL_UNITS_ORDERED - predictions) / test_transformed23$TOTAL_UNITS_ORDERED)) * 100
+r_squared <- cor(test_transformed23$TOTAL_UNITS_ORDERED, predictions)^2
+
+# Adjusted R-squared calculation
+n <- nrow(test_transformed23)  # Number of observations
+p <- length(lm_model$coefficients) - 1  # Number of predictors
+adj_r_squared <- 1 - ((1 - r_squared) * (n - 1) / (n - p - 1))
+
+# Output Results
+cat("Linear Regression Model Performance:\n")
+cat("RMSE:", rmse_value, "\n")
+cat("R-squared:", r_squared, "\n")
+cat("MAPE:", mape_value, "%\n")
+# View Predictions
+output_data <- test_transformed23 %>%
+  mutate(Predicted_UNITS_ORDERED = predictions)
+```
+
+### Linear model for 2024
+```{r}
+# Create a recipe with step_novel for unseen factor levels
+my_recipe <- recipe(TOTAL_UNITS_ORDERED ~ ., data = train_2024_data) %>%
+  step_novel(all_nominal(), new_level = "Unknown") %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>% # should prevent dummy variable trap 
+  step_nzv(all_predictors()) |> 
+  step_select(-TOTAL_UNITS_LOADED, -TOTAL_UNITS_DELIVERED,
+              -TRADE_CHANNEL_GENERAL, -SUB_TRADE_CHANNEL_FSR...MISC, 
+              -SUB_TRADE_CHANNEL_OTHER.DINING, 
+              -SUB_TRADE_CHANNEL_OTHER.OUTDOOR.ACTIVITIES, 
+              -TRADE_CHANNEL_OUTDOOR.ACTIVITIES) %>%   
+  step_normalize(all_numeric_predictors()) 
+
+# Prepare the recipe with the training data
+prepped <- prep(my_recipe, training = train_2024_data)
+
+# Apply the recipe to the training and test data
+train_transformed24 <- bake(prepped, new_data = train_2024_data)
+test_transformed24 <- bake(prepped, new_data = test_2024)
+
+# Build Linear Regression Model using multiple predictors
+lm_model_24 <- lm(TOTAL_UNITS_ORDERED ~ ., data = train_transformed24)
+
+# Make Predictions
+predictions_24 <- predict(lm_model_24, newdata = test_transformed24)
+
+# Manually Calculate RMSE, MAPE, R-squared, and Adjusted R-squared
+rmse_value_24 <- sqrt(mean((test_transformed24$TOTAL_UNITS_ORDERED - predictions_24)^2))
+mape_value_24 <- mean(abs((test_transformed24$TOTAL_UNITS_ORDERED - predictions_24) / test_transformed24$TOTAL_UNITS_ORDERED)) * 100
+r_squared_24 <- cor(test_transformed24$TOTAL_UNITS_ORDERED, predictions_24)^2
+
+# Adjusted R-squared calculation
+n_24 <- nrow(test_transformed24)  # Number of observations
+p_24 <- length(lm_model_24$coefficients) - 1  # Number of predictors
+adj_r_squared_24 <- 1 - ((1 - r_squared_24) * (n_24 - 1) / (n_24 - p_24 - 1))
+
+# Output Results
+cat("Linear Regression Model Performance:\n")
+cat("RMSE:", rmse_value_24, "\n")
+cat("R-squared:", r_squared_24, "\n")
+cat("MAPE:", mape_value_24, "%\n")
+
+# View Predictions
+output_data_24 <- test_transformed24 %>%
+  mutate(Predicted_UNITS_ORDERED = predictions_24)
+```
+
+### LASSO & RIDGE for 2023
+```{r}
+# Convert categorical variables to dummy variables
+x_train <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = train_transformed23)[,-1]
+x_test <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = test_transformed23)[,-1]
+y_train <- train_transformed23$TOTAL_UNITS_ORDERED
+
+# Ensure all features are numeric
+x_train <- as.matrix(x_train)
+x_test <- as.matrix(x_test)
+y_train <- as.numeric(y_train)
+
+# Ridge Regression (alpha = 0)
+ridge_model <- cv.glmnet(x_train, y_train, alpha = 0)  # Cross-validated Ridge
+ridge_preds <- predict(ridge_model, newx = x_test, s = "lambda.min")
+
+# Evaluate Ridge Model
+ridge_rmse <- sqrt(mean((test_transformed23$TOTAL_UNITS_ORDERED - ridge_preds)^2))
+ridge_mape <- mean(abs((test_transformed23$TOTAL_UNITS_ORDERED - ridge_preds) / test_transformed23$TOTAL_UNITS_ORDERED)) * 100
+ridge_r2 <- cor(test_transformed23$TOTAL_UNITS_ORDERED, ridge_preds)^2
+
+# Adjusted R-squared Calculation
+n <- nrow(test_transformed23)
+p <- length(coef(ridge_model, s = "lambda.min")) - 1
+ridge_adj_r2 <- 1 - ((1 - ridge_r2) * (n - 1) / (n - p - 1))
+
+# Output Results
+cat("Ridge Regression Model Performance:\n")
+cat("RMSE:", ridge_rmse, "\n")
+cat("R-squared:", ridge_r2, "\n")
+cat("MAPE:", ridge_mape, "%\n")
+```
+
+###LASSO & RIDGE for 2024
+```{r}
+# Convert categorical variables to dummy variables
+x_train_24 <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = train_transformed24)[,-1]
+x_test_24 <- model.matrix(TOTAL_UNITS_ORDERED ~ ., data = test_transformed24)[,-1]
+y_train_24 <- train_transformed24$TOTAL_UNITS_ORDERED
+
+# Ensure all features are numeric
+x_train_24 <- as.matrix(x_train_24)
+x_test_24 <- as.matrix(x_test_24)
+y_train_24 <- as.numeric(y_train_24)
+
+# Ridge Regression (alpha = 0)
+ridge_model_24 <- cv.glmnet(x_train_24, y_train_24, alpha = 0)  # Cross-validated Ridge
+ridge_preds_24 <- predict(ridge_model_24, newx = x_test_24, s = "lambda.min")
+
+# Evaluate Ridge Model
+ridge_rmse_24 <- sqrt(mean((test_transformed24$TOTAL_UNITS_ORDERED - ridge_preds_24)^2))
+ridge_mape_24 <- mean(abs((test_transformed24$TOTAL_UNITS_ORDERED - ridge_preds_24) / test_transformed24$TOTAL_UNITS_ORDERED)) * 100
+ridge_r2_24 <- cor(test_transformed24$TOTAL_UNITS_ORDERED, ridge_preds_24)^2
+
+# Adjusted R-squared Calculation
+n_24 <- nrow(test_transformed24)
+p_24 <- length(coef(ridge_model_24, s = "lambda.min")) - 1
+ridge_adj_r2_24 <- 1 - ((1 - ridge_r2_24) * (n_24 - 1) / (n_24 - p_24 - 1))
+
+# Output Results
+cat("Ridge Regression Model Performance:\n")
+cat("RMSE:", ridge_rmse_24, "\n")
+cat("R-squared:", ridge_r2_24, "\n")
+cat("MAPE:", ridge_mape_24, "%\n")
+```
+
