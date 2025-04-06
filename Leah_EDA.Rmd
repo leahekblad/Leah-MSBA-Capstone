@@ -1,0 +1,202 @@
+---
+title: "Leah_EDA"
+author: "Leah Ekblad"
+date: "2024-09-15"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_location: left
+    toc_title: "Contents"
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Introduction
+Swire Coca-Cola (SCCU) is optimizing its logistics strategy by transitioning low-volume customers to an Alternate Route to Market (ARTM) using third-party (white truck) deliveries, while prioritizing high-volume customers for direct (red truck) deliveries. The goal is to determine an optimal sales volume threshold for transitioning customers, identify high-growth-potential accounts, and integrate predictive insights into SCCU’s routing strategy.
+
+This analysis is supported by four datasets: Customer Profile, Transactional Data, Delivery Cost Data, and ZIP Mapping Data. These datasets provide insights into customer purchasing behavior, delivery costs, and geographic distribution, which will inform data-driven logistics decisions.
+
+## Business Problem
+SCCU faces challenges in balancing cost efficiency and customer service in its delivery operations. The key problems include:
+
+Optimizing Route-to-Market (RTM) Strategy – Determining which customers should be shifted to ARTM to reduce operational costs while maintaining service quality.
+Identifying High-Potential Customers – Ensuring that high-growth-potential customers are retained within the direct delivery network (red truck) to foster long-term profitability.
+Cost Analysis & Threshold Definition – Establishing clear volume-based thresholds for transitioning customers while considering delivery cost structures.
+This analysis aims to provide data-driven recommendations to refine SCCU’s logistics model.
+
+# Description of the Data
+1. Customer Profile Data
+30,478 customers with details on their ordering habits, trade channels, and onboarding dates.
+Key fields: customer_number, trade_channel, on_boarding_date, first_delivery_date, local_market_partner.
+2. Transactional Data
+Over 1 million records tracking weekly transactions, including order volume and delivery fulfillment.
+Key fields: customer_number, transaction_date, ordered_cases, delivered_cases, ordered_gallons, delivered_gallons.
+3. Delivery Cost Data
+Contains cost structures for different cold drink channels, showing delivery costs per unit for various product types.
+Key fields: cold_drink_channel, applicable_to, median_delivery_cost, cost_type, min_volume, max_volume.
+4. ZIP Mapping Data
+1,801 ZIP codes linked to geographic information for understanding regional distribution.
+Key fields: zip_code, full_address.
+
+# Initial Questions
+Threshold Identification: What is the optimal sales volume threshold to determine whether a customer should receive red truck vs. white truck delivery?
+Growth Potential: Can we identify customers with potential for increased purchases who should remain in the direct delivery network?
+Order & Delivery Efficiency: How often do customers receive full vs. partial order fulfillment, and does this vary by RTM type?
+Delivery Cost Analysis: How do median delivery costs vary across different customer segments and volume ranges?
+Market Segmentation: Are there specific trade channels or geographic regions where ARTM or direct delivery would be more effective?
+The answers to these questions will guide SCCU in optimizing its logistics strategy, reducing costs, and improving service levels.
+
+
+```{r setup, include=FALSE}
+#| include: false
+
+# Packages
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(janitor)
+
+# Data
+transact_data <- read_csv("transactional_data.csv")
+customer_profile <- read_csv("customer_profile.csv")
+customer_address_and_zip_mapping <- read_csv("customer_address_and_zip_mapping.csv")
+cost_data <- read_csv("delivery_cost_data.xlsx")
+```
+
+## customer_address_and_zip_mapping
+### Cleaning
+- Separated out address into multiple columns
+```{r}
+# Clean customer address and zip mapping data 
+
+# Use strsplit to split the full_address by commas
+clean_customer_address_and_zip_mapping <- strsplit(customer_address_and_zip_mapping$'full address', ",")
+
+# Convert the split data into a data frame
+# Use sapply to apply strsplit to the entire column and then transpose the result using t()
+clean_customer_address_and_zip_mapping <- as.data.frame(t(sapply(clean_customer_address_and_zip_mapping, c)))
+
+# Assign column names
+colnames(clean_customer_address_and_zip_mapping) <- c("Zip Code", "City", "State", "StateAbbr", "County", "Region", "Latitude", "Longitude")
+```
+
+## transact_data
+### Cleaing
+- Converted date fields to the Date format
+- Handled missing values: 
+  - This resulted in no rows omitted because only transaction date has NAs - I dont think we want to remove those because it still has all of the other data as well as the week of the year
+
+### Feature Engineering
+- Broke out date into Month and day, year and week were already created
+- Aggregated by customer for total annual orders
+- Order fufillment ratio
+  - There are a lot of NAs
+  - This feature measures how much of the ordered quantity was actually delivered. It's an important metric for understanding order fulfillment efficiency and customer satisfaction
+  - Interpretation: A ratio of 1 means full fulfillment, while less than 1 indicates partial fulfillment
+- Order Backlog: This metric indicates if there are any outstanding orders that were not delivered. It's useful to identify customers that are frequently unable to receive their full order quantity.
+  - Interpretation: A positive value indicates unfulfilled orders, while a value of 0 indicates complete fulfillment.
+- Creating a 'Season' feature based on the month of the transaction date
+```{r}
+# Clean transact data
+
+# View the data
+summary(transact_data)
+
+# Convert the TRANSACTION_DATE to Date type
+transact_data$TRANSACTION_DATE <- as.Date(transact_data$TRANSACTION_DATE)
+
+# Filter out rows with missing values in key columns
+# This results in no rows omitted because only transaction date has NAs - I don't think we want to remove those because it still has all of the other data as well as the week of the year
+transact_data_clean <- transact_data %>%
+  filter(!is.na(ORDERED_CASES) & !is.na(LOADED_CASES) & !is.na(DELIVERED_CASES) & 
+         !is.na(ORDERED_GALLONS) & !is.na(LOADED_GALLONS) & !is.na(DELIVERED_GALLONS))
+
+# Feature Engineering
+
+# Create additional columns for Month and day
+transact_data_clean$MONTH <- month(transact_data_clean$TRANSACTION_DATE)
+transact_data_clean$DAY <- day(transact_data_clean$TRANSACTION_DATE)
+
+# Create a new column for the total ordered volume (cases + gallons) for comparison purposes
+transact_data_clean$Total_Ordered_Volume <- transact_data_clean$ORDERED_CASES + transact_data_clean$ORDERED_GALLONS
+
+# Order Fulfillment Ratio
+transact_data_clean$Fulfillment_Ratio <- transact_data_clean$DELIVERED_GALLONS / transact_data_clean$ORDERED_GALLONS
+
+# Order Backlog
+transact_data_clean$Backlog_Gallons <- transact_data_clean$ORDERED_GALLONS - transact_data_clean$DELIVERED_GALLONS
+
+# Creating a 'Season' feature based on the month of the transaction date
+transact_data_clean$Season <- case_when(
+  month(transact_data_clean$TRANSACTION_DATE) %in% c(12, 1, 2) ~ "Winter",   # December, January, February
+  month(transact_data_clean$TRANSACTION_DATE) %in% c(3, 4, 5) ~ "Spring",   # March, April, May
+  month(transact_data_clean$TRANSACTION_DATE) %in% c(6, 7, 8) ~ "Summer",   # June, July, August
+  month(transact_data_clean$TRANSACTION_DATE) %in% c(9, 10, 11) ~ "Fall",   # September, October, November
+  TRUE ~ "Unknown"  # Default case if something unexpected happens
+)
+
+```
+
+## customer_profile
+### Cleaning
+- Convert date fields to the Date format
+- Handle missing values: 
+  - For categorical columns, filled missing values with "Unknown" or "Other".
+  - For numerical columns, filled with median 
+
+### Feature Engineering
+  - Calculate the delay between onboarding and first delivery
+  - Customer Tenure (Days, Months, Years)
+  - Days to First Delivery: Calculates how long it takes for a customer to receive their first delivery after onboarding.
+  - Customer Type Based on First Delivery Speed: Categorizes customers based on how fast they received their first delivery.
+```{r}
+# Clean customer profile data
+
+# View the data
+summary(customer_profile)
+
+# Work with a clean version of the data
+clean_customer_profile = customer_profile
+
+# Convert `FIRST_DELIVERY_DATE` and `ON_BOARDING_DATE` to Date format
+clean_customer_profile$FIRST_DELIVERY_DATE <- as.Date(clean_customer_profile$FIRST_DELIVERY_DATE, format="%m/%d/%Y")
+clean_customer_profile$ON_BOARDING_DATE <- as.Date(clean_customer_profile$ON_BOARDING_DATE, format="%m/%d/%Y")
+
+
+# Check missing values
+colSums(is.na(clean_customer_profile))
+
+# Fill missing categorical values with "Unknown"
+clean_customer_profile$FREQUENT_ORDER_TYPE[is.na(clean_customer_profile$FREQUENT_ORDER_TYPE)] <- "Unknown"
+
+# Fill missing numerical values (if applicable) with median
+clean_customer_profile$FIRST_DELIVERY_DATE[is.na(clean_customer_profile$FIRST_DELIVERY_DATE)] <- median(clean_customer_profile$FIRST_DELIVERY_DATE, na.rm = TRUE)
+clean_customer_profile$ON_BOARDING_DATE[is.na(clean_customer_profile$ON_BOARDING_DATE)] <- median(clean_customer_profile$ON_BOARDING_DATE, na.rm = TRUE)
+
+#Feature Engineering
+# Calculate the delay between onboarding and first delivery
+clean_customer_profile$DAYS_TO_FIRST_DELIVERY <- as.numeric(clean_customer_profile$FIRST_DELIVERY_DATE - clean_customer_profile$ON_BOARDING_DATE)
+
+# Customer Tenure (Days, Months, Years)
+clean_customer_profile$CUSTOMER_TENURE_DAYS <- as.numeric(Sys.Date() - clean_customer_profile$ON_BOARDING_DATE)
+clean_customer_profile$CUSTOMER_TENURE_MONTHS <- round(clean_customer_profile$CUSTOMER_TENURE_DAYS / 30, 1)
+clean_customer_profile$CUSTOMER_TENURE_YEARS <- round(clean_customer_profile$CUSTOMER_TENURE_DAYS / 365, 1)
+
+# Days to first delivery
+clean_customer_profile$DAYS_TO_FIRST_DELIVERY <- as.numeric(clean_customer_profile$FIRST_DELIVERY_DATE - clean_customer_profile$ON_BOARDING_DATE)
+
+# Customer Type Based on First Delivery Speed
+clean_customer_profile$DELIVERY_SPEED_CATEGORY <- case_when(
+  clean_customer_profile$DAYS_TO_FIRST_DELIVERY <= 7 ~ "Fast (0-7 days)",
+  clean_customer_profile$DAYS_TO_FIRST_DELIVERY <= 30 ~ "Moderate (8-30 days)",
+  clean_customer_profile$DAYS_TO_FIRST_DELIVERY > 30 ~ "Slow (>30 days)",
+  is.na(clean_customer_profile$DAYS_TO_FIRST_DELIVERY) ~ "Unknown"
+)
+```
+
+
